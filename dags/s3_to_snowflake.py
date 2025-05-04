@@ -2,48 +2,63 @@ from airflow import DAG
 from airflow.operators.dummy import DummyOperator
 from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
-from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from datetime import datetime
+import snowflake.connector
 import logging
+from airflow.models import Variable  # ✅ keep this for snowflake variables
 
-def copy_into_snowflake(table_name, s3_path):
-    """
-    Uses SnowflakeHook to execute COPY INTO for loading data from S3 to Snowflake.
-    Transactional: TRUNCATE → COPY INTO → COMMIT / ROLLBACK
-    """
-    hook = SnowflakeHook(snowflake_conn_id='snowflake_conn')  # Airflow connection ID
-    conn = hook.get_conn()
-    cursor = conn.cursor()
-    
+def copy_into_snowflake(table_name, s3_path, database='USER_DB_FALCON'):
+    conn = None
+    cs = None
+    fq_table = f"{database}.RAW.{table_name}"  # fully-qualified table name
+
     try:
-        logging.info(f"Starting transaction for RAW.{table_name}")
-        cursor.execute("BEGIN;")
-        
-        logging.info(f"Truncating table RAW.{table_name}")
-        cursor.execute(f"TRUNCATE TABLE RAW.{table_name};")
-        
+        logging.info("Connecting to Snowflake...")
+        conn = snowflake.connector.connect(
+            user=Variable.get('snowflake_user'),
+            password=Variable.get('snowflake_password'),
+            account=Variable.get('snowflake_account'),
+            warehouse=Variable.get('snowflake_warehouse'),
+            database=database,
+            schema='RAW'
+        )
+        cs = conn.cursor()
+
+        cs.execute(f"USE DATABASE {database}")
+        cs.execute(f"USE SCHEMA RAW")
+
+        logging.info(f"Starting transaction for {fq_table}")
+        cs.execute("BEGIN;")
+
+        logging.info(f"Truncating {fq_table}")
+        cs.execute(f"TRUNCATE TABLE {fq_table}")
+
         sql = f"""
-            COPY INTO RAW.{table_name}
+            COPY INTO {fq_table}
             FROM '{s3_path}'
-            STORAGE_INTEGRATION = my_s3_integration
-            FILE_FORMAT = (type = 'CSV' skip_header = 1 field_optionally_enclosed_by='"');
+            STORAGE_INTEGRATION = MY_S3_INTEGRATION
+            FILE_FORMAT = MY_CSV_FORMAT
+            ON_ERROR = 'CONTINUE';
         """
-        logging.info(f"Executing COPY INTO for RAW.{table_name}")
-        cursor.execute(sql)
-        
-        cursor.execute("COMMIT;")
-        logging.info(f"Load completed for RAW.{table_name}")
-    
+        logging.info(f"Executing COPY INTO for {fq_table}")
+        cs.execute(sql)
+
+        logging.info(f"Committing transaction for {fq_table}")
+        cs.execute("COMMIT;")
+        logging.info(f"Load completed for {fq_table}")
+
     except Exception as e:
-        logging.error(f"Error loading RAW.{table_name}: {e}")
-        cursor.execute("ROLLBACK;")
-        logging.info(f"Transaction rolled back for RAW.{table_name}")
+        logging.error(f"Error loading {fq_table}: {e}")
+        if cs:
+            cs.execute("ROLLBACK;")
+            logging.info(f"Transaction rolled back for {fq_table}")
         raise
-    
     finally:
-        cursor.close()
-        conn.close()
-        logging.info(f"Connection closed for RAW.{table_name}")
+        if cs:
+            cs.close()
+        if conn:
+            conn.close()
+        logging.info(f"Connection closed for {fq_table}")
 
 default_args = {
     'owner': 'airflow',
@@ -56,57 +71,21 @@ with DAG(
     default_args=default_args,
     schedule_interval=None,
     catchup=False,
-    description='ETL DAG to load auto insurance churn data from S3 into Snowflake RAW schema with COPY INTO'
+    description='ETL DAG to load auto insurance churn data from S3 into Snowflake RAW schema'
 ) as dag:
 
     start = DummyOperator(task_id='start')
 
     with TaskGroup('load_data_to_snowflake') as load_data_to_snowflake:
-
-        copy_address = PythonOperator(
-            task_id='copy_address_data_to_snowflake',
-            python_callable=copy_into_snowflake,
-            op_kwargs={
-                'table_name': 'address',
-                's3_path': 's3://data226project/address.csv'
-            }
-        )
-
-        copy_customer = PythonOperator(
-            task_id='copy_customer_data_to_snowflake',
-            python_callable=copy_into_snowflake,
-            op_kwargs={
-                'table_name': 'customer',
-                's3_path': 's3://data226project/customer.csv'
-            }
-        )
-
-        copy_demographic = PythonOperator(
-            task_id='copy_demographic_data_to_snowflake',
-            python_callable=copy_into_snowflake,
-            op_kwargs={
-                'table_name': 'demographic',
-                's3_path': 's3://data226project/demographic.csv'
-            }
-        )
-
-        copy_termination = PythonOperator(
-            task_id='copy_termination_data_to_snowflake',
-            python_callable=copy_into_snowflake,
-            op_kwargs={
-                'table_name': 'termination',
-                's3_path': 's3://data226project/termination.csv'
-            }
-        )
-
-        copy_autoinsurance_churn = PythonOperator(
-            task_id='copy_autoinsurance_churn_data_to_snowflake',
-            python_callable=copy_into_snowflake,
-            op_kwargs={
-                'table_name': 'autoinsurance_churn',
-                's3_path': 's3://data226project/autoinsurance_churn.csv'
-            }
-        )
+        for table_name in ['address', 'customer', 'demographic', 'termination', 'autoinsurance_churn']:
+            PythonOperator(
+                task_id=f'copy_{table_name}_data_to_snowflake',
+                python_callable=copy_into_snowflake,
+                op_kwargs={
+                    'table_name': table_name,
+                    's3_path': f's3://data226project/{table_name}.csv'
+                }
+            )
 
     end = DummyOperator(task_id='end')
 
